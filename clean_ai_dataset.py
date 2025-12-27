@@ -17,6 +17,6 @@ sampled_indices = random.sample(range(total_len), num_samples)
 sampled_data = ds.select(sampled_indices)
 
 
-df = pd.DataFrame(sampled_data)
+df = pd.DataFrame(sampled_data.to_dict())
 df.to_csv(output_csv_path, index=False)
 print(f"Saved {num_samples} random resumes to: {output_csv_path}")

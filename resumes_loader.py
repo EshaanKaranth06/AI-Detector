@@ -6,6 +6,7 @@ import time
 import json
 from qdrant_client.http.models import PointStruct
 from pathlib import Path
+from typing import Set
 
 logger = get_logger("logs/resumes_loader.log")
 
@@ -24,8 +25,16 @@ def delete_with_retry(file_path: Path, max_retries: int = 3, delay: float = 1.0)
     logger.error(f"Failed to delete {file_path} after {max_retries} attempts")
     return False
 
-def process_resume(file_path: str, qdrant_client, model, splitter, processed_files: set, failed_files: set, id_counter: int, collection_name: str) -> int:
-    file_path = Path(file_path)
+def process_resume(
+    file_path: Path,
+    qdrant_client, 
+    model, 
+    splitter, 
+    processed_files: Set[str],
+    failed_files: Set[str],
+    id_counter: int, 
+    collection_name: str
+) -> int:
     filename = file_path.name
     file_ext = file_path.suffix.lower()
     was_converted = False
@@ -64,7 +73,7 @@ def process_resume(file_path: str, qdrant_client, model, splitter, processed_fil
     md_text = ""
     try:
         import pymupdf4llm
-        md_text = pymupdf4llm.to_markdown(str(processing_path)).lower()
+        md_text = str(pymupdf4llm.to_markdown(str(processing_path))).lower()
         if not md_text.strip():
             logger.info(f"Empty markdown from pymupdf4llm for {filename}. Falling back to unstructured.")
             md_text = unstructured_to_markdown(processing_path)
@@ -93,13 +102,17 @@ def process_resume(file_path: str, qdrant_client, model, splitter, processed_fil
             failed_files.add(filename)
             return id_counter
 
-        embeddings = model.encode(texts, show_progress_bar=True)
+        # ✅ ADD E5 INSTRUCTION PREFIX FOR REFERENCE DOCUMENTS
+        logger.info(f"Encoding {len(texts)} chunks with 'passage:' prefix for {filename}")
+        texts_with_instruction = [f"passage: {text}" for text in texts]
+        embeddings = model.encode(texts_with_instruction, show_progress_bar=True)
 
+        # ✅ STORE ORIGINAL TEXT (without prefix) IN PAYLOAD
         points_to_upload = [
             PointStruct(
                 id=id_counter + i,
                 vector=emb.tolist(),
-                payload={"text": texts[i], "source_file": filename}
+                payload={"text": texts[i], "source_file": filename}  # Original text without prefix
             )
             for i, emb in enumerate(embeddings)
         ]
@@ -107,7 +120,7 @@ def process_resume(file_path: str, qdrant_client, model, splitter, processed_fil
         if points_to_upload and safe_upsert_with_retry(qdrant_client, collection_name, points_to_upload):
             processed_files.add(filename)
             logger.info(f"Uploaded {len(points_to_upload)} vectors from {filename}")
-            print(f"Uploaded {len(points_to_upload)} vectors from {filename}")  # Optional: Add console output for success
+            print(f"Uploaded {len(points_to_upload)} vectors from {filename}")
             id_counter += len(points_to_upload)
         else:
             logger.error(f"Skipped saving {filename} due to upload failure")
@@ -124,9 +137,18 @@ def main():
         validate_environment()
         qdrant_url = os.getenv("QDRANT_URL")
         qdrant_api_key = os.getenv("QDRANT_API_KEY")
+        
+        # Check for None values
+        if not qdrant_url or not qdrant_api_key:
+            raise ValueError("QDRANT_URL and QDRANT_API_KEY must be set in environment")
+        
         init(qdrant_url, qdrant_api_key, COLLECTION_NAME)
         
         from common_utils import qdrant, model, splitter
+        
+        # Check if components are initialized
+        if qdrant is None or model is None or splitter is None:
+            raise ValueError("Failed to initialize required components")
         
         resumes_folder = input("Enter the path to the resumes folder: ").strip()
         resumes_path = validate_folder(resumes_folder, folder_type="input")
@@ -136,20 +158,23 @@ def main():
         count_tracker = Path("processing/count.json")
 
         # Initialize sets for this run
-        processed_files = load_json_set(processed_files_tracker)
-        failed_files = set()  # Start fresh to avoid carrying over old failures
+        processed_files: Set[str] = load_json_set(processed_files_tracker)
+        failed_files: Set[str] = set()
         logger.info(f"Loaded {len(processed_files)} previously processed files")
         logger.info(f"Starting with empty failed_files set for this run")
 
         try:
             stats = qdrant.get_collection(COLLECTION_NAME)
-            id_counter = stats.vectors_count or 0
+            # Use getattr with a default value to handle missing attribute
+            id_counter = getattr(stats, 'vectors_count', None) or 0
             logger.info(f"Starting id_counter at {id_counter}")
         except Exception as e:
             logger.error(f"Failed to get collection info: {e}. Starting ID counter at 0.")
             id_counter = 0
 
-        resumes_path.mkdir(parents=True, exist_ok=True)
+        # Create processing directory if it doesn't exist
+        Path("processing").mkdir(parents=True, exist_ok=True)
+        
         for filename in os.listdir(resumes_path):
             file_path = resumes_path / filename
             if not file_path.is_file():
