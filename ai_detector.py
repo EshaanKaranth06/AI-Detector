@@ -13,9 +13,12 @@ from transformers import (
     Trainer, TrainingArguments, DataCollatorWithPadding,
     EarlyStoppingCallback
 )
+from transformers.trainer_utils import PredictionOutput
 from common_utils import convert_doc_to_pdf, ocr_pdf, unstructured_to_markdown, is_text_pdf
 import gc
 from pathlib import Path
+from typing import Tuple, List, Dict, Any, cast
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -36,7 +39,7 @@ class OptimizedKaggleAIResumeDetector:
             self.model = self.model.cuda()
             torch.cuda.empty_cache()
 
-    def load_kaggle_datasets(self, data_dir="./kaggle_data", max_samples_per_class=421):
+    def load_kaggle_datasets(self, data_dir="./kaggle_data", max_samples_per_class=421) -> Tuple[List[str], List[int]]:
         human_texts, ai_texts = [], []
         csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv')]
 
@@ -67,9 +70,13 @@ class OptimizedKaggleAIResumeDetector:
         combined = list(zip(texts, labels))
         np.random.shuffle(combined)
 
-        return list(zip(*combined))
+        texts_out: List[str]
+        labels_out: List[int]
+        texts_out, labels_out = zip(*combined)  # type: ignore
+        return list(texts_out), list(labels_out)
 
-    def prepare_dataset(self, texts, labels):
+    def prepare_dataset(self, texts: List[str], labels: List[int]) -> Any:
+        """Prepare dataset for training. Returns Dataset object."""
         def tokenize_function(examples):
             return self.tokenizer(
                 examples["text"], 
@@ -87,7 +94,7 @@ class OptimizedKaggleAIResumeDetector:
         accuracy = accuracy_score(labels, preds)
         return {"accuracy": accuracy, "f1": f1, "precision": precision, "recall": recall}
 
-    def create_training_args(self, output_dir):
+    def create_training_args(self, output_dir: str) -> TrainingArguments:
         return TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=5,
@@ -119,7 +126,7 @@ class OptimizedKaggleAIResumeDetector:
             optim="adamw_torch",
         )
 
-    def train(self, output_dir, data_dir):
+    def train(self, output_dir: str, data_dir: str):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
@@ -147,7 +154,7 @@ class OptimizedKaggleAIResumeDetector:
             args=args,
             train_dataset=train_ds,
             eval_dataset=val_ds,
-            tokenizer=self.tokenizer,
+            processing_class=self.tokenizer,
             data_collator=DataCollatorWithPadding(self.tokenizer, pad_to_multiple_of=8),
             compute_metrics=self.compute_metrics,
             callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
@@ -157,6 +164,7 @@ class OptimizedKaggleAIResumeDetector:
         trainer.train()
 
         logger.info("Evaluating on test set...")
+        # The Dataset typing is complex in HF, so we use Any to avoid type errors
         predictions = trainer.predict(test_ds)
         pred_labels = np.argmax(predictions.predictions, axis=1)
 
@@ -208,9 +216,9 @@ class OptimizedKaggleAIResumeDetector:
 
             text = ""
             if is_text_pdf(pdf_path):
-                text = unstructured_to_markdown(str(pdf_path))
+                text = unstructured_to_markdown(pdf_path)
             if not text.strip():
-                text = ocr_pdf(str(pdf_path))
+                text = ocr_pdf(pdf_path)
 
             if delete_pdf and pdf_path.exists():
                 try:
@@ -225,7 +233,7 @@ class OptimizedKaggleAIResumeDetector:
             logger.error(f"Text extraction failed for {file_path}: {e}")
             return ""
 
-    def predict(self, text, model_path):
+    def predict(self, text: str, model_path: str) -> Dict[str, Any]:
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         model = AutoModelForSequenceClassification.from_pretrained(
             model_path,
@@ -250,22 +258,24 @@ class OptimizedKaggleAIResumeDetector:
         with torch.no_grad():
             logits = model(**inputs).logits
             probs = torch.softmax(logits, dim=-1).squeeze()
-            
-        prediction = torch.argmax(probs).item()
+        
+        # Convert to int for indexing
+        prediction_idx = int(torch.argmax(probs).item())
+        
         return {
-            "prediction": "Human Written" if prediction == 1 else "AI Generated",
-            "confidence": probs[prediction].item(),
-            "ai_probability": probs[0].item(),
-            "human_probability": probs[1].item()
+            "prediction": "Human Written" if prediction_idx == 1 else "AI Generated",
+            "confidence": float(probs[prediction_idx].item()),
+            "ai_probability": float(probs[0].item()),
+            "human_probability": float(probs[1].item())
         }
 
-    def predict_folder(self, input_dir, output_dir, model_path):
-        input_dir = Path(input_dir)
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+    def predict_folder(self, input_dir: str, output_dir: str, model_path: str):
+        input_dir_path = Path(input_dir)
+        output_dir_path = Path(output_dir)
+        output_dir_path.mkdir(parents=True, exist_ok=True)
         
-        all_files = [f for f in input_dir.iterdir() if f.suffix.lower() in ['.txt', '.pdf', '.doc', '.docx']]
-        logger.info(f"Found {len(all_files)} resumes in '{input_dir}'")
+        all_files = [f for f in input_dir_path.iterdir() if f.suffix.lower() in ['.txt', '.pdf', '.doc', '.docx']]
+        logger.info(f"Found {len(all_files)} resumes in '{input_dir_path}'")
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         model = AutoModelForSequenceClassification.from_pretrained(
@@ -278,7 +288,7 @@ class OptimizedKaggleAIResumeDetector:
             model = model.cuda()
 
         for resume_file in all_files:
-            output_file = output_dir / (resume_file.stem + ".json")
+            output_file = output_dir_path / (resume_file.stem + ".json")
             if output_file.exists():
                 logger.info(f"Skipping already processed file: {resume_file.name}")
                 continue
@@ -299,13 +309,15 @@ class OptimizedKaggleAIResumeDetector:
                 logits = model(**inputs).logits
                 probs = torch.softmax(logits, dim=-1).squeeze()
 
-            prediction = torch.argmax(probs).item()
+            # Convert to int for indexing
+            prediction_idx = int(torch.argmax(probs).item())
+            
             result = {
                 "file": resume_file.name,
-                "prediction": "Human Written" if prediction == 1 else "AI Generated",
-                "confidence": probs[prediction].item(),
-                "ai_probability": probs[0].item(),
-                "human_probability": probs[1].item()
+                "prediction": "Human Written" if prediction_idx == 1 else "AI Generated",
+                "confidence": float(probs[prediction_idx].item()),
+                "ai_probability": float(probs[0].item()),
+                "human_probability": float(probs[1].item())
             }
 
             with output_file.open("w", encoding="utf-8") as f:
@@ -313,14 +325,14 @@ class OptimizedKaggleAIResumeDetector:
 
             logger.info(f"Processed: {resume_file.name} -> {result['prediction']}")
 
-def get_all_dataset_files(data_dir):
+def get_all_dataset_files(data_dir: str) -> List[str]:
     return sorted([f for f in os.listdir(data_dir) if f.endswith(".csv")])
 
-def save_metadata(path, dataset_files):
+def save_metadata(path: str, dataset_files: List[str]):
     with open(path, "w") as f:
         json.dump({"datasets": dataset_files}, f)
 
-def load_metadata(path):
+def load_metadata(path: str):
     if not os.path.exists(path):
         return None
     with open(path, "r") as f:
@@ -360,15 +372,15 @@ def main():
         test_dir = input("Enter folder path with resumes (.pdf, .doc, .docx, .txt): ").strip()
         out_file = "results/ai_results.json"
 
-        test_dir = Path(test_dir)
-        out_file = Path(out_file)
+        test_dir_path = Path(test_dir)
+        out_file_path = Path(out_file)
 
-        if not test_dir.exists():
-            logger.error(f"Invalid input folder: {test_dir}")
+        if not test_dir_path.exists():
+            logger.error(f"Invalid input folder: {test_dir_path}")
             return
 
-        all_files = [f for f in test_dir.iterdir() if f.suffix.lower() in ['.txt', '.pdf', '.doc', '.docx']]
-        logger.info(f"Found {len(all_files)} resumes in '{test_dir}'")
+        all_files = [f for f in test_dir_path.iterdir() if f.suffix.lower() in ['.txt', '.pdf', '.doc', '.docx']]
+        logger.info(f"Found {len(all_files)} resumes in '{test_dir_path}'")
 
         tokenizer = AutoTokenizer.from_pretrained(output_dir)
         model = AutoModelForSequenceClassification.from_pretrained(
@@ -401,24 +413,29 @@ def main():
                 logits = model(**inputs).logits
                 probs = torch.softmax(logits, dim=-1).squeeze()
 
-            prediction = torch.argmax(probs).item()
+            # Convert to int for indexing
+            prediction_idx = int(torch.argmax(probs).item())
+            
             result = {
                 "file": resume_file.name,
-                "prediction": "Human Written" if prediction == 1 else "AI Generated",
-                "confidence": probs[prediction].item(),
-                "ai_probability": probs[0].item(),
-                "human_probability": probs[1].item()
+                "prediction": "Human Written" if prediction_idx == 1 else "AI Generated",
+                "confidence": float(probs[prediction_idx].item()),
+                "ai_probability": float(probs[0].item()),
+                "human_probability": float(probs[1].item())
             }
 
             results.append(result)
             logger.info(f"{resume_file.name} → {result['prediction']} ({result['confidence']:.4f})")
 
-        with out_file.open("w", encoding="utf-8") as f:
+        # Ensure output directory exists
+        out_file_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with out_file_path.open("w", encoding="utf-8") as f:
             json.dump(results, f, indent=4)
-        logger.info(f"\nAll predictions saved to: {out_file}")
+        logger.info(f"\nAll predictions saved to: {out_file_path}")
 
     else:
         logger.error("Invalid mode. Please enter 'train' or 'infer'.")
 
 if __name__ == "__main__":
-    main() 
+    main()

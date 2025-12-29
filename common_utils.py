@@ -194,23 +194,36 @@ def safe_upsert_with_retry(client: QdrantClient, collection_name: str, points: l
     logger.error("Qdrant upsert failed after all retries.")
   return False
 
+# In common_utils.py, find the convert_doc_to_pdf function and modify it:
+
 def convert_doc_to_pdf(file_path: Path) -> Optional[Path]:
   output_dir = file_path.parent
   pdf_path = output_dir / f"{file_path.stem}.pdf"
   try:
+    possible_paths = [
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+            "soffice",  # If in PATH
+        ]
+    soffice_path = None
+    for path in possible_paths:
+        if Path(path).exists() or path == "soffice":
+            soffice_path = path
+            break
+    if not soffice_path:
+        logger.error("LibreOffice not found. Please install it from libreoffice.org")#type: ignore
+        return None
     subprocess.run(
-      [
-        "soffice",
-        "--headless",
-        "--convert-to",
-        "pdf",
-        "--outdir",
-        str(output_dir),
-        str(file_path)
-      ],
-      check=True,
-      stdout=subprocess.PIPE,
-      stderr=subprocess.PIPE
+            [
+                soffice_path,
+                "--headless",
+                "--convert-to", "pdf",
+                "--outdir", str(output_dir),
+                str(file_path)
+            ],
+            check=True,
+            timeout=30,
+            capture_output=True
     )
     if pdf_path.exists():
       if logger:
@@ -223,6 +236,7 @@ def convert_doc_to_pdf(file_path: Path) -> Optional[Path]:
     if logger:
       logger.error(f"LibreOffice conversion failed for {file_path}: {e}")
     return None
+
 
 def is_text_pdf(file_path: Path) -> bool:
   try:

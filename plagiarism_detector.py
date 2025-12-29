@@ -1,26 +1,22 @@
 import os
 import re
-from unittest import result
 import phonenumbers
 from collections import Counter
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional, Union
+from typing import Any, List, Dict, Optional, Union
 from qdrant_client.models import ScoredPoint
 import json
 import pytesseract
 from PIL import Image, ImageEnhance, ImageOps
 from pdf2image import convert_from_path
 import time
-from sympy import composite
-import torch
+from rf_classifier import PlagiarismRFClassifier
 from dotenv import load_dotenv
-
 import pymupdf4llm
 from langchain_text_splitters import MarkdownTextSplitter, RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
-from qdrant_client.models import QueryResponse
 from sklearn.feature_extraction.text import TfidfVectorizer
 from unstructured.partition.auto import partition
 from common_utils import (
@@ -44,20 +40,14 @@ COLLECTION_NAME: Optional[str] = None
 INPUT_FOLDER: Optional[str] = None
 OUTPUT_FOLDER: Optional[str] = None
 REFERENCE_FOLDER: Optional[str] = None
-
+rf_classifier: Optional[PlagiarismRFClassifier] = None
 
 def resume_section_split(text: str) -> List[str]:
-  """
-  Resume-aware splitter that identifies and preserves semantic sections.
-  This prevents splitting across role+years, responsibilities+tools, etc.
-  """
-  # Split on common resume section headers (case-insensitive)
   sections = re.split(
     r'\n(?=(experience|skills|education|summary|profile|work|projects|certifications?|achievements?|qualifications?|objective|career\s+objective|professional\s+summary|work\s+experience|educational\s+background|technical\s+skills|personal\s+details|contact|references)\b)',
     text.lower()
   )
   
-  # Filter out very short sections (likely just headers)
   meaningful_sections = []
   for s in sections:
     stripped = s.strip()
@@ -115,14 +105,14 @@ def unstructured_to_markdown(file_path: Path) -> str:
 
 
 def init(qdrant_url: str, qdrant_api_key: str, collection_name: str) -> None:
-  global qdrant, model, splitter, tfidf_vectorizer, processed_files_cache, text_cache, COLLECTION_NAME
+  global qdrant, model, splitter, tfidf_vectorizer, processed_files_cache, text_cache, COLLECTION_NAME, rf_classifier
   
   if not qdrant_url or not qdrant_api_key:
     raise ValueError("QDRANT_URL and QDRANT_API_KEY must be set in the environment variables")
   
   COLLECTION_NAME = collection_name
   
-  # Always load the model during init to avoid "Model not initialized" errors
+  # Always load the model during init to avoid Model not initialized errors
   load_model() 
   
   splitter = MarkdownTextSplitter(chunk_size=300, chunk_overlap=75)
@@ -135,6 +125,20 @@ def init(qdrant_url: str, qdrant_api_key: str, collection_name: str) -> None:
   processed_files_cache = {}
   text_cache = {}
   initialize_qdrant(qdrant_url, qdrant_api_key)
+
+  try:
+    rf_model_path = Path("models/plagiarism_rf.pkl")
+    if rf_model_path.exists():
+      assert rf_model_path is not None
+      rf_classifier = PlagiarismRFClassifier(rf_model_path)
+      logger.info("Random Forest classifier loaded successfully")
+    else:
+        logger.warning("RF model not found at models/plagiarism_rf.pkl")
+        logger.warning("Using fallback rule-based classification")
+        rf_classifier = None
+  except Exception as e:
+        logger.error(f"Failed to load RF classifier: {e}")
+        rf_classifier = None
 
 
 def load_model() -> None:
@@ -190,7 +194,6 @@ def ensure_collection_exists() -> None:
   except Exception as e:
     logger.error(f"Error managing collection: {e}")
     raise
-
 
 def extract_text_from_file(file_path: Path) -> str:
   global text_cache
@@ -296,7 +299,6 @@ def get_resume_files(folder_path: Path) -> List[Path]:
 
 
 def classify_plagiarism_level(overall_score, flagged_score, sources, flagged_chunks):
-  # CRITICAL: Detect structural theft (Variant B/C)
   # If 4+ chunks come from 1 person, it's PLAGIARIZED regardless of the low % score
   if len(sources) == 1 and flagged_chunks >= 4:
     return True, "PLAGIARIZED (Identity Theft Pattern)"
@@ -352,10 +354,10 @@ def extract_contact_text(path: Path) -> str:
 
 def extract_emails(text: str, fallback_path: Optional[Path] = None) -> List[str]:
   def run_email_regex(content: str) -> List[str]:
-    # Extract emails with a forgiving regex
+    # Extract emails
     pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
     found = re.findall(pattern, content, re.IGNORECASE)
-    return list(set(email.lower() for email in found)) # lowercase for consistency
+    return list(set(email.lower() for email in found)) 
 
   emails = []
 
@@ -390,9 +392,9 @@ def extract_phones(text: str, region: str = "IN", fallback_path: Optional[Path] 
   def run_phone_regex(content: str) -> List[str]:
     phone_regex = re.compile(
       r'''(
-        (?:\+|00)?91[\s\-\.()]*(\d{5})[\s\-\.()]*(\d{5})    # Indian numbers like +91 97624 47134
+        (?:\+|00)?91[\s\-\.()]*(\d{5})[\s\-\.()]*(\d{5})    # Indian numbers
         |
-        \(?\+?\d{1,4}\)?[\s\-\.()]*(\d{2,5})[\s\-\.()]*(\d{6,8}) # Any intl number loosely
+        \(?\+?\d{1,4}\)?[\s\-\.()]*(\d{2,5})[\s\-\.()]*(\d{6,8})
         |
         \(?\d{3}\)?[\s\-\.()]?\d{3}[\s\-\.()]?\d{4}       # US format
       )''',
@@ -503,7 +505,7 @@ def analyze_document(text: str, filename: str, file_path: Path) -> Dict:
     'input_phones': [],
     'source_emails': [],
     'source_phones': [],
-    'bleurt_scores': [] # Store average BLEURT scores for matched chunks as [score, filename, score, filename, ...]
+    'bleurt_scores': [] 
   }
 
   try:
@@ -548,7 +550,6 @@ def analyze_document(text: str, filename: str, file_path: Path) -> Dict:
       results['input_phones'] = []
 
     try:
-      #  FIX 1: Use resume-aware section splitting
       logger.info(f"Applying resume-aware section splitting for {filename}")
       sections = resume_section_split(text)
       logger.info(f"Identified {len(sections)} semantic sections")
@@ -571,21 +572,25 @@ def analyze_document(text: str, filename: str, file_path: Path) -> Dict:
           'experience', 'education', 'objective', 'summary',
           'contact', 'personal', 'references', 'declaration',
           'career objective', 'professional summary', 'work experience',
-          'educational background', 'technical skills', 'personal details'
+          'educational background', 'technical skills', 'personal details','board', 'school', 'university', 'degree',
+          'certified', 'certification', 'azure', 'aws', 'dp-', 'ai-', 'az-','nvidia'
         ]
         
         # Common single/few word entries
         common_words = [
           'public', 'private', 'protected', 'static', 'final', 'abstract',
           'class', 'interface', 'extends', 'implements',
-          'male', 'female', 'married', 'single', 'hindi', 'english'
+          'male', 'female', 'married', 'single', 'hindi', 'english',
+          'aws', 'ec2', 's3', 'vpc', 'iam', 'lambda', 'rds', 'dynamodb', 
+        'java', 'python', 'javascript', 'html', 'css', 'react', 'node',
+        'sql', 'docker', 'kubernetes', 'jenkins', 'git', 'agile', 'scrum',
         ]
         
         # Check if chunk is just a generic header or common word
         if any(header in lowered for header in generic_headers):
           # Additional check: if it's mostly just the header with minimal content
           words = lowered.split()
-          if len(words) <= 3: # Very short chunks are likely just headers
+          if len(words) <= 5: # Very short chunks are likely just headers
             return True
         
         # Check if chunk is just common programming/resume keywords
@@ -650,46 +655,8 @@ def analyze_document(text: str, filename: str, file_path: Path) -> Dict:
     matched_chunks = []
     source_contacts: Dict[str, Dict[str, List[str]]] = {}
     source_bleurt_scores: Dict[str, List[float]] = {} # Track BLEURT scores for matched chunks per source file
-
-    def is_meaningful_match(input_text: str, matched_text: str, composite_score: float) -> bool:
-      """
-      Bulletproof filter: Catches vague compressed plagiarism while ignoring 
-      shared industry industry jargon (False Positives).
-      """
-      import re
-      input_clean = input_text.lower().strip()
-      matched_clean = matched_text.lower().strip()
-
-      # 1. THE NOISE REDUCER
-      # Remove common industry "filler" that everyone has on their resume
-      fillers = ["cross-functional", "team player", "stakeholders", "fast-paced", "responsible for"]
-      meaningful_input = input_clean
-      for f in fillers:
-        meaningful_input = meaningful_input.replace(f, "")
-      
-      # 2. THE LENGTH GATE (Reduced to catch Variant C)
-      # If the input is very short after removing fillers, it's probably not a meaningful match
-      if len(meaningful_input.split()) < 2:
-        return False
-
-      # 3. GENERIC PATTERN FILTER (Expanded)
-      generic_patterns = [
-        r'^(responsibilities|skills|experience|education|summary|profile|projects|languages)\s*:?\s*$',
-        r'^[\-\*]\s*$', # Just a bullet point
-        r'^page \d+ of \d+$' # Page numbers
-      ]
-      for pattern in generic_patterns:
-        if re.match(pattern, input_clean):
-          return False
-
-      # 4. DYNAMIC THRESHOLD (The "Secret Sauce")
-      # Case A: Short/Vague phrases (Variant C) -> Require high confidence
-      if len(input_clean.split()) < 6:
-        return composite_score > 0.65 
-      
-      # Case B: Standard sentences (Variant A & B) -> Standard threshold
-      # We lower this to 0.40 to ensure we don't miss the "Arjun Mahadev" variants
-      return composite_score > 0.40
+    chunk_features_for_rf: List[Dict[str, Any]] = []
+    
     
     source_hit_map = Counter()
 
@@ -730,38 +697,107 @@ def analyze_document(text: str, filename: str, file_path: Path) -> Dict:
               cosine_score, tfidf_score, fuzzy_score, ngram_score
             )
 
-            chunk_max_score = max(chunk_max_score, composite_score)
+            def is_boilerplate_content(input_text: str, matched_text: str) -> bool:
+                """Detect if content is standard resume boilerplate"""
+                input_lower = input_text.lower()
+                match_lower = matched_text.lower()
+                
+                # 1. Certification patterns
+                cert_keywords = ['certified', 'certification', 'certificate', 'credential']
+                cert_providers = ['microsoft', 'aws', 'azure', 'google cloud', 'oracle', 
+                                'cisco', 'comptia', 'pmp', 'scrum', 'databricks', 'nptel']
+                
+                has_cert_keyword = any(kw in input_lower for kw in cert_keywords)
+                has_cert_provider = any(prov in input_lower for prov in cert_providers)
+                
+                if has_cert_keyword and has_cert_provider:
+                    # Both texts mention certifications - likely standard cert list
+                    return True
+                
+                # 2. Education section patterns
+                education_keywords = ['education', 'academic', 'degree', 'university', 
+                                    'college', 'school', 'bachelor', 'master', 'b.tech',
+                                    'm.tech', 'b.e', 'm.e', 'bca', 'mca', '10th', '12th',
+                                    'sslc', 'hsc', 'board', 'examination']
+                
+                edu_count = sum(1 for kw in education_keywords if kw in input_lower)
+                
+                # Check for table-like structure (common in education sections)
+                has_pipes = '|' in input_text or '|' in matched_text
+                has_years = any(str(year) in input_text for year in range(2000, 2030))
+                
+                if edu_count >= 2 and (has_pipes or has_years):
+                    return True
+                
+                # 3. Section headers (very short, mostly formatting)
+                if len(input_text.split()) <= 5 and len(matched_text.split()) <= 5:
+                    header_words = ['experience', 'education', 'skills', 'summary', 
+                                    'objective', 'projects', 'details', 'information',
+                                    'professional', 'academic', 'technical', 'certifications',
+                                    'professional experience', 'work experience', 'employment history',
+                                    'software engineer', 'data engineer', 'developer', 'analyst',
+                                    'present', 'current', '–', 'pvt ltd', 'inc', 'technologies']
+                    if any(hw in input_lower for hw in header_words):
+                        return True
+                
+               
+                date_patterns = ['present', 'current', '–', '-']
+                location_patterns = ['india', 'bangalore', 'pune', 'mumbai', 'delhi', 
+                                    'hyderabad', 'chennai', 'noida', 'gurgaon']
+                
+                has_dates = any(dp in input_lower for dp in date_patterns)
+                has_location = any(lp in input_lower for lp in location_patterns)
+                
+                if has_dates and has_location and len(input_text.split('\n')) <= 4:
+                    return True
+                
+                return False
 
+            if is_boilerplate_content(texts[i], matched_text):
+                logger.debug(f"Skipping boilerplate match: {texts[i][:50]}...")
+                continue
+
+            chunk_max_score = max(chunk_max_score, composite_score)
             is_semantic = (cosine_score > 0.82 and bleurt_score > 0.45)
             is_literal = (ngram_score > 0.40 or tfidf_score > 0.45)
             is_pattern = (cosine_score > 0.65 and source_hit_map[source_file] >= 2)
 
-            # Updated plagiarism detection with stricter criteria and meaningful match check
+ 
             if is_literal or is_semantic or is_pattern:
-              # Update trackers
-              source_hit_map[source_file] += 1
-              plagiarized_sources.add(source_file)
-              all_scores.append(composite_score)
-              
-              # Track BLEURT for final reporting
-              if source_file not in source_bleurt_scores:
-                source_bleurt_scores[source_file] = []
-                source_bleurt_scores[source_file].append(bleurt_score)
-
-                matched_chunks.append({
-                  'similarity_score': composite_score * 100,
-                  'source_url': source_file,
-                  'input_chunk': texts[i],
-                  'source_chunk': matched_text,
-                  'bleurt_score': bleurt_score
+            
+                chunk_features_for_rf.append({
+                    "cosine": cosine_score,
+                    "tfidf": tfidf_score,
+                    "ngram": ngram_score,
+                    "fuzzy": fuzzy_score,
+                    "bleurt": bleurt_score,
+                    "composite": composite_score,
+                    "source_file": source_file,
                 })
                 
-                # Important: break to avoid matching the same input chunk 
-                # to multiple chunks in the SAME source file
-                break
-                #plagiarized_sources.add(source_file)
-                #all_scores.append(composite_score)
-                # Store BLEURT score for matched chunks
+                source_hit_map[source_file] += 1
+                plagiarized_sources.add(source_file)
+                all_scores.append(composite_score)
+                
+                
+                if source_file not in source_bleurt_scores:
+                    source_bleurt_scores[source_file] = []
+                    source_bleurt_scores[source_file].append(bleurt_score)
+
+                    matched_chunks.append({
+                    'similarity_score': composite_score * 100,
+                    'source_url': source_file,
+                    'input_chunk': texts[i],
+                    'source_chunk': matched_text,
+                    'bleurt_score': bleurt_score,
+                    'cosine_score': cosine_score,
+                    'tfidf_score': tfidf_score,
+                    'ngram_score': ngram_score,
+                    'fuzzy_score': fuzzy_score,
+                    })
+                    
+                    # this one is to break to avoid matching the same input chunk to multiple chunks in the same source file 
+                    break
           except Exception as e:
             logger.error(f"Error processing match {i}: {e}")
             continue
@@ -836,17 +872,89 @@ def analyze_document(text: str, filename: str, file_path: Path) -> Dict:
     results['plagiarized_sources'] = list(plagiarized_sources)
     results['matched_chunks'] = matched_chunks
 
-    is_plagiarized, level = classify_plagiarism_level(
-      results['overall_score'], results['flagged_score'], results['plagiarized_sources'], results['flagged_chunks']
-    )
-    results['is_plagiarized'] = is_plagiarized
-    results['plagiarism_level'] = level
+    # Use RF classifier if available, otherwise fallback to rules
+    global rf_classifier
+    
+    if rf_classifier is not None and chunk_features_for_rf:
+        try:
+            logger.debug(f"Using RF with {len(chunk_features_for_rf)} features")
+            
+            # Build source map from collected features
+            rf_source_map: Dict[str, int] = {}
+            for feat in chunk_features_for_rf:
+                src = feat['source_file']
+                rf_source_map[src] = rf_source_map.get(src, 0) + 1
+            
+            # Get RF features and predict
+            features = rf_classifier.extract_features(
+                chunk_features_for_rf,
+                total_chunks=len(texts),
+                source_hit_map=rf_source_map
+            )
+            
+            is_plagiarized, level, confidence = rf_classifier.predict(features)
+            
 
-    if is_plagiarized and plagiarized_sources:
-      print(f"Extracting contact info from {len(plagiarized_sources)} source files")
-      source_emails = []
+            if level == "LOW":
+                is_plagiarized = False
+
+            if level == "HIGH" and len(results['matched_chunks']) < 3:
+                level = "MODERATE"      
+
+            if is_plagiarized and len(results['matched_chunks']) <= 1:
+                is_plagiarized = False # Silence the alarm for single matches
+                level = "CLEAN (Minor Overlap)"
+                
+            if confidence < 0.6:
+                is_plagiarized = False
+                level = "CLEAN"
+            
+            results['is_plagiarized'] = is_plagiarized
+            results['plagiarism_level'] = level
+            results['rf_confidence'] = confidence
+            results['classification_method'] = 'random_forest'
+            
+            # Update sources based on RF decision
+            if is_plagiarized:
+                strong_sources = set()
+                for feat in chunk_features_for_rf:
+                    src = feat['source_file']
+                    if (feat['composite'] > 0.50 or 
+                        feat['cosine'] > 0.75 or
+                        rf_source_map[src] >= 2):
+                        strong_sources.add(src)
+                results['plagiarized_sources'] = list(strong_sources)
+            else:
+                results['plagiarized_sources'] = []
+            
+            logger.info(f"RF: {level} (conf: {confidence:.3f})")
+            
+        except Exception as e:
+            logger.error(f"RF failed: {e}, using fallback")
+            is_plagiarized, level = classify_plagiarism_level(
+                results['overall_score'], results['flagged_score'],
+                list(plagiarized_sources), results['flagged_chunks']
+            )
+            results['is_plagiarized'] = is_plagiarized
+            results['plagiarism_level'] = level
+            results['rf_confidence'] = None
+            results['classification_method'] = 'rule_based_fallback'
+    else:
+        # Fallback to rule-based
+        is_plagiarized, level = classify_plagiarism_level(
+            results['overall_score'], results['flagged_score'],
+            list(plagiarized_sources), results['flagged_chunks']
+        )
+        results['is_plagiarized'] = is_plagiarized
+        results['plagiarism_level'] = level
+        results['rf_confidence'] = None
+        results['classification_method'] = 'rule_based'
+
+    if is_plagiarized and results['plagiarized_sources']:
+      print(f"Extracting contact info from {len(results['plagiarized_sources'])} source files")
       source_phones = []
-      for source_file in plagiarized_sources:
+      source_emails = []
+      for source_file in results['plagiarized_sources']:
         if source_file in source_contacts:
           src_emails = source_contacts[source_file]['emails']
           src_phones = source_contacts[source_file]['phones']
