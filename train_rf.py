@@ -1,11 +1,3 @@
-"""
-TRAINING SCRIPT FOR RANDOM FOREST CLASSIFIER
-=============================================
-
-This script trains the RF model using your existing plagiarism results in the damn json file.
-
-"""
-
 import json
 import numpy as np
 from pathlib import Path
